@@ -13,25 +13,29 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MAX30105 particleSensor;
 
-// ================= 极简参数配置 =================
-const int FILTER_SIZE = 5;            // 轻度滑动平均窗口（5个点，刚好抹平毛刺）
-const int MIN_BEAT_INTERVAL = 500;    // 不应期500ms（最高允许120BPM），防止双倍误判
-const int BPM_WINDOW_SIZE = 5;        // ⚠️ 新增：心率滑动窗口大小（存最近5次心跳）
+// ================= 参数配置 =================
+const int FILTER_SIZE = 10;           
+const int MIN_BEAT_INTERVAL = 400;    
 
-// ================= 滤波器变量 =================
+// ⚠️ 修改：将滑动窗口从 3 放宽到 5（如果你想要更稳，可以改成 6）
+// 配合下面的突变锁，既能保证平滑，又能快速响应
+const int BPM_WINDOW_SIZE = 5;        
+
+const float MAX_BPM_JUMP = 10.0;       
+int rejectCount = 0; 
+
 long irBuffer[FILTER_SIZE];
 int bufferIndex = 0;
 long irSum = 0;
-float filteredIR = 0;                 // 滤波后的IR
-float slowBaseline = 0;               // 缓慢移动的基线（地平线）
-bool isAboveThreshold = false;        // 状态机标志位（记录当前是否在地平线之上）
+float filteredIR = 0;                 
+float slowBaseline = 0;               
+float lastAC = 0;                     
+float dynamicThreshold = 100;         
 
-// ================= 心率变量 =================
 float currentBPM = 0;
 unsigned long lastBeatTime = 0;
 unsigned long lastDisplay = 0;
 
-// ⚠️ 新增：心率滑动窗口缓冲区
 float bpmWindow[BPM_WINDOW_SIZE] = {0};
 int bpmIndex = 0;
 
@@ -48,7 +52,7 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println("Simple Algo V2...");
+    display.println("Algorithm V8...");
     display.display();
   }
 
@@ -60,9 +64,8 @@ void setup() {
   particleSensor.setup(); 
   particleSensor.setPulseAmplitudeRed(0x1F);
   particleSensor.setPulseAmplitudeIR(0x1F);
-  particleSensor.setSampleRate(100); // 100Hz采样率
+  particleSensor.setSampleRate(100); 
 
-  // 预填充滤波器，防开机剧烈跳动
   for(int i = 0; i < FILTER_SIZE; i++) {
     irBuffer[i] = particleSensor.getIR();
     irSum += irBuffer[i];
@@ -75,64 +78,86 @@ void setup() {
 void loop() {
   long rawIR = particleSensor.getIR();
 
-  // 1. 滑动平均滤波（轻度去噪）
+  // 1. 滑动平均滤波
   irSum -= irBuffer[bufferIndex];
   irBuffer[bufferIndex] = rawIR;
   irSum += rawIR;
   bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
   filteredIR = (float)irSum / FILTER_SIZE;
 
-  // 2. 缓慢追踪基线（地平线，系数0.01表示跟随极慢，忽略心跳波动）
-  slowBaseline = (0.99 * slowBaseline) + (0.01 * filteredIR);
+  // 2. 基线追踪与交流分量提取
+  slowBaseline = (0.90 * slowBaseline) + (0.10 * filteredIR);
+  float acSignal = filteredIR - slowBaseline;
+  float slope = acSignal - lastAC;
+  lastAC = acSignal;
 
-  // 3. 极简波峰检测（信号向上穿越基线）
-  if (rawIR > 8000) { // 有手指的前提下
-    if (filteredIR > slowBaseline && !isAboveThreshold) {
-      isAboveThreshold = true;
-      
+  // 3. 动态阈值
+  if (acSignal > dynamicThreshold) {
+    dynamicThreshold = (0.8 * dynamicThreshold) + (0.2 * acSignal); 
+  } else {
+    dynamicThreshold = (0.99 * dynamicThreshold) + (0.01 * acSignal);
+  }
+  if (dynamicThreshold < 30) dynamicThreshold = 30; 
+
+  // 4. 波峰检测
+  if (rawIR > 8000) { 
+    if (slope < 0 && acSignal > dynamicThreshold && (millis() - lastBeatTime > MIN_BEAT_INTERVAL)) {
       unsigned long currentTime = millis();
-      if (currentTime - lastBeatTime > MIN_BEAT_INTERVAL) {
-        float interval = (currentTime - lastBeatTime) / 1000.0;
+      float interval = (currentTime - lastBeatTime) / 1000.0;
+      
+      if (lastBeatTime != 0) { 
         float instantBPM = 60.0 / interval;
-
-        // 生理限制过滤（防止乱算）
-        if (instantBPM > 45.0 && instantBPM < 120.0) {
-          // ⚠️ 修改：不再使用迟钝的加权平均，改用滑动窗口平均
-          bpmWindow[bpmIndex] = instantBPM;
-          bpmIndex = (bpmIndex + 1) % BPM_WINDOW_SIZE;
+        
+        if (instantBPM > 40.0 && instantBPM < 150.0) { 
           
-          float sum = 0;
-          int count = 0;
-          for(int i = 0; i < BPM_WINDOW_SIZE; i++) {
-            if(bpmWindow[i] > 0) {
-              sum += bpmWindow[i];
-              count++;
+          if (currentBPM == 0 || abs(instantBPM - currentBPM) <= MAX_BPM_JUMP) {
+            rejectCount = 0; 
+            
+            bpmWindow[bpmIndex] = instantBPM;
+            bpmIndex = (bpmIndex + 1) % BPM_WINDOW_SIZE;
+            
+            float sum = 0;
+            int count = 0;
+            for(int i = 0; i < BPM_WINDOW_SIZE; i++) {
+              if(bpmWindow[i] > 0) {
+                sum += bpmWindow[i];
+                count++;
+              }
+            }
+            if(count > 0) {
+              currentBPM = sum / count; 
+            }
+          } else {
+            rejectCount++;
+            Serial.printf("Jump Rejected (%d/5): %.2f -> %.2f\n", rejectCount, currentBPM, instantBPM);
+            
+            if (rejectCount >= 5) {
+              Serial.println("Force Reset BPM due to continuous rejection!");
+              currentBPM = 0; 
+              rejectCount = 0;
+              for(int i = 0; i < BPM_WINDOW_SIZE; i++) bpmWindow[i] = 0; 
             }
           }
-          if(count > 0) {
-            currentBPM = sum / count; // 瞬间响应，同时保持稳定
-          }
         }
-        lastBeatTime = currentTime;
       }
-    } else if (filteredIR < slowBaseline) {
-      isAboveThreshold = false;
+      lastBeatTime = currentTime;
     }
   } else {
     // 没手指时重置
     currentBPM = 0;
+    rejectCount = 0;
     lastBeatTime = 0;
-    isAboveThreshold = false;
-    for(int i = 0; i < BPM_WINDOW_SIZE; i++) bpmWindow[i] = 0; // 清空滑动窗口
+    dynamicThreshold = 100;
+    for(int i = 0; i < BPM_WINDOW_SIZE; i++) bpmWindow[i] = 0; 
   }
 
-  // 4. 发给 Teleplot 画图
+  // 5. 发给 Teleplot
   Serial.printf(">RawIR:%ld\n", rawIR);
   Serial.printf(">FilteredIR:%f\n", filteredIR);
   Serial.printf(">Baseline:%f\n", slowBaseline);
   Serial.printf(">BPM:%f\n", currentBPM);
 
-  // 5. 刷新 OLED 屏幕
+  // 6. 刷新 OLED
   if (millis() - lastDisplay > 200) {
     lastDisplay = millis();
     display.clearDisplay();
